@@ -1,4 +1,4 @@
-IL2Winwing
+WarThunder-WinWing-vibration-support
 ==========
 
 This application is a simple proxy between IL-2 GB and WinWing SimApp Pro, enabling vibration feedback for owners of the WinWing sticks and
