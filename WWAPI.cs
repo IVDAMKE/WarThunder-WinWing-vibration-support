@@ -12,19 +12,19 @@ namespace IL2WinWing
 {
     public class WWMessageEventArgs : EventArgs
     {
-        public string msg { get; set; }
+        public string msg { get; set; } = string.Empty;
     }
+
     internal class WWAPI
     {
         private UdpClient wwClient = new UdpClient();
-        
         private IPEndPoint wwEP = new IPEndPoint(IPAddress.Parse("127.0.0.1"), Properties.Settings.Default.WWPort);
         private bool listen = false;
 
         private const string NET_READY = "{\"func\": \"net\", \"msg\": \"ready\"}";
         private const string MSN_READY = "{\"func\": \"mission\", \"msg\": \"ready\"}";
         private const string MSN_START = "{\"func\": \"mission\", \"msg\": \"start\"}";
-        private const string MOD       = "{\"func\": \"mod\", \"msg\": \"TF-51D\"}";
+        private const string MOD       = "{\"func\": \"mod\", \"msg\": \"FA-18C_hornet\"}"; // Updated for modern jet feedback
         private const string MSN_STOP  = "{\"func\": \"mission\", \"msg\": \"stop\"}";
 
         public bool wwInit { get; set; } = false;
@@ -44,8 +44,19 @@ namespace IL2WinWing
             public float accelerationX { get; set; }
             public float accelerationY { get; set; }
             public float accelerationZ { get; set; }
-            public bool hasPayload { get; set; } = false;
-            public bool hasNoPayload { get; set; } = true;
+            
+            // --- NEW FUNCTIONING ARGS ADDED ---
+            public float machNumber { get; set; }
+            public float fuelQuantity { get; set; }
+            public float engine1Rpm { get; set; }
+            public float engine2Rpm { get; set; }
+            public float engine1Temp { get; set; }
+            public float engine2Temp { get; set; }
+            public float gForce { get; set; }
+            public float sideSlip { get; set; }
+            
+            public bool hasPayload { get; set; } = true;
+            public bool hasNoPayload { get; set; } = false;
             public List<object> payloadStations { get; set; } = new List<object>();
         }
 
@@ -65,6 +76,7 @@ namespace IL2WinWing
             wwClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             wwClient.Client.Connect(wwEP);
         }
+
         ~WWAPI()
         {
             wwClient.Close();
@@ -95,77 +107,26 @@ namespace IL2WinWing
         {
             if (msg == WWMessage.START)
             {
-                byte[] bytes = Encoding.ASCII.GetBytes(MSN_STOP);
-                try
+                string[] initMsgs = { MSN_STOP, NET_READY, MSN_READY, MSN_START, MOD };
+                foreach (var m in initMsgs)
                 {
-                    wwClient.Send(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
-                bytes = Encoding.ASCII.GetBytes(NET_READY);
-                try
-                {
-                    wwClient.Send(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
-                bytes = Encoding.ASCII.GetBytes(MSN_READY);
-                try
-                {
-                    wwClient.Send(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
-                bytes = Encoding.ASCII.GetBytes(MSN_START);
-                try
-                {
-                    wwClient.Send(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
-                bytes = Encoding.ASCII.GetBytes(MOD);
-                try
-                {
-                    wwClient.Send(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
+                    byte[] bytes = Encoding.ASCII.GetBytes(m);
+                    try { wwClient.Send(bytes, bytes.Length, wwEP); }
+                    catch { return false; }
                 }
             }
             else if (msg == WWMessage.UPDATE && telemetry != null && wwInit)
             {
                 string json = JsonSerializer.Serialize(telemetry);
                 byte[] bytes = Encoding.ASCII.GetBytes(json);
-                try
-                {
-                    wwClient.SendAsync(bytes, bytes.Length, wwEP);
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
+                try { wwClient.SendAsync(bytes, bytes.Length, wwEP); }
+                catch { return false; }
             }
             else if (msg == WWMessage.STOP && wwInit)
             {
                 byte[] bytes = Encoding.ASCII.GetBytes(MSN_STOP);
-                try
-                {
-                    wwClient.SendAsync(bytes, bytes.Length, wwEP);
-                    wwInit = false;
-                }
-                catch (Exception)
-                {
-                    return false;
-                }
+                try { wwClient.SendAsync(bytes, bytes.Length, wwEP); wwInit = false; }
+                catch { return false; }
             }
             return true;
         }
@@ -177,29 +138,17 @@ namespace IL2WinWing
                 try
                 {
                     byte[] data = wwClient.Receive(ref wwEP);
-
                     if (data.Length > 0)
                     {
-                        WWMessageEventArgs msg = new WWMessageEventArgs();
-                        msg.msg = Encoding.ASCII.GetString(data);
-                        WWMessageReceived(this, msg);
+                        WWMessageEventArgs msg = new WWMessageEventArgs { msg = Encoding.ASCII.GetString(data) };
+                        WWMessageReceived?.Invoke(this, msg);
                     }
                 }
-                catch (Exception)
-                {
-                    listen = false;
-                }
-
+                catch { listen = false; }
                 Thread.Sleep(25);
             }
         }
 
-        protected virtual void OnWWMessage(WWMessageEventArgs e)
-        {
-            EventHandler<WWMessageEventArgs> handler = WWMessageReceived;
-            handler?.Invoke(this, e);
-        }
-
-        public event EventHandler<WWMessageEventArgs> WWMessageReceived;
+        public event EventHandler<WWMessageEventArgs>? WWMessageReceived;
     }
 }

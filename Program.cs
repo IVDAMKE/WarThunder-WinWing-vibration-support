@@ -1,16 +1,14 @@
+using System.Diagnostics;
 using System.Net;
+using System.Net.Http.Json;
 using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
+using System.Text.Json.Nodes;
 
 namespace IL2WinWing
 {
     internal static class Program
     {
-        /// <summary>
-        ///  The main entry point for the application.
-        /// </summary>
         [STAThread]
         static void Main()
         {
@@ -23,36 +21,39 @@ namespace IL2WinWing
 
     public class CustomAppContext : ApplicationContext
     {
-        private UdpClient telemetryClient = new UdpClient();
-        private IPEndPoint teleEP = new IPEndPoint(IPAddress.Parse("127.0.0.1"), Properties.Settings.Default.IL2TelemetryPort);
+        // Ground Calibration
+        private float _fieldElevation = 0.0f;
+        private bool _calibrated = false;
+        private bool _gearIsDown = true; 
 
-        private IL2Protocol.Motion motion = new IL2Protocol.Motion();
+        // Network
+        private readonly HttpClient httpClient = new HttpClient();
+        private const string WT_STATE_URL = "http://127.0.0.1:8111/state";
+        private const string WT_INDICATORS_URL = "http://127.0.0.1:8111/indicators";
+
+        // Logic variables
         private int gunShells = 1000;
         private float lastAoA = 0.0F;
-
-        private readonly NotifyIcon trayIcon;
-        private DebugWindow? debugWindow;
         private bool run = true;
         private bool waitingForWWInit = false;
 
+        private readonly NotifyIcon trayIcon;
+        private DebugWindow? debugWindow;
         private WWAPI wwAPI = new WWAPI();
 
         public CustomAppContext()
         {
             trayIcon = new NotifyIcon();
             trayIcon.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-            trayIcon.Text = "IL2WinWing";
+            trayIcon.Text = "WarThunderWinWing";
             trayIcon.ContextMenuStrip = new ContextMenuStrip();
             trayIcon.ContextMenuStrip.Items.Add("Debug", null, ShowDebugWindow);
             trayIcon.ContextMenuStrip.Items.Add("-");
             trayIcon.ContextMenuStrip.Items.Add("Exit", null, Exit);
             trayIcon.Visible = true;
 
-            telemetryClient.ExclusiveAddressUse = false;
-            telemetryClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            telemetryClient.Client.Bind(teleEP);
-
-            new Task(IL2Listener).Start();
+            new Task(WarThunderPoller).Start();
+            
             wwAPI.WWMessageReceived += OnWWMessage;
             wwAPI.StartListen();
         }
@@ -61,6 +62,7 @@ namespace IL2WinWing
         {
             wwAPI.TearDown();
             run = false;
+            httpClient.Dispose();
         }
 
         private void OnWWMessage(object? sender, WWMessageEventArgs e)
@@ -83,406 +85,117 @@ namespace IL2WinWing
             debugWindow.Show();
         }
 
-        private void IL2Listener()
+        private async void WarThunderPoller()
         {
-            byte[] bytes;
-            try
+            if (!wwAPI.wwInit && !waitingForWWInit)
             {
-                while (run)
+                waitingForWWInit = true;
+                wwAPI.Send(WWAPI.WWMessage.START);
+            }
+
+            while (run)
+            {
+                try
                 {
-                    bytes = telemetryClient.Receive(ref teleEP);
-
-                    if (bytes.Length > 0)
+                    if (wwAPI.wwInit)
                     {
-                        if (!wwAPI.wwInit && !waitingForWWInit)
-                        {
-                            waitingForWWInit = true;
-                            wwAPI.Send(WWAPI.WWMessage.START);
-                        }
-                        else
-                        {
-                            ParseIL2Message(bytes);
-                        }
+                        await ParseWarThunderData();
                     }
-
-                    Thread.Sleep(25);
+                    else if (!waitingForWWInit)
+                    {
+                         waitingForWWInit = true;
+                         wwAPI.Send(WWAPI.WWMessage.START);
+                    }
                 }
-            }
-            catch (SocketException e)
-            {
-                debugWindow?.AddText(e.Message);
-            }
-            finally
-            {
-                run = false;
-                telemetryClient.Close();
+                catch (HttpRequestException) { /* WT not running */ }
+                catch (Exception ex) { debugWindow?.AddText("Error: " + ex.Message); }
+
+                await Task.Delay(1); 
             }
         }
 
-        private void ParseIL2Message(byte[] bytes)
+       private async Task ParseWarThunderData()
+{
+    string stateJson, indicatorsJson;
+    try 
+    {
+        stateJson = await httpClient.GetStringAsync(WT_STATE_URL);
+        indicatorsJson = await httpClient.GetStringAsync(WT_INDICATORS_URL);
+    }
+    catch { return; }
+
+    JsonNode? stateNode = JsonNode.Parse(stateJson);
+    JsonNode? indicatorsNode = JsonNode.Parse(indicatorsJson);
+    
+    if (stateNode == null || indicatorsNode == null) return;
+    
+    bool stateValid = (bool?)stateNode["valid"] ?? false;
+    bool indValid = (bool?)indicatorsNode["valid"] ?? false;
+    if (!stateValid || !indValid) return;
+
+    WWAPI.WWTelemetryMsg wwTelemetry = new WWAPI.WWTelemetryMsg();
+    Random rnd = new Random();
+
+    // --- GEAR & RADAR ALT ---
+    // float gearInd = (float?)indicatorsNode["gears"] ?? 0.5f;
+    // if (gearInd == 0.0f) _gearIsDown = false;
+    // else if (gearInd == 1.0f) _gearIsDown = true;
+    // wwTelemetry.args.gearValue = gearInd;
+    // wwTelemetry.args.isGearDown = _gearIsDown;
+    // float radarAlt = GetSimulatedRadarAlt(stateNode, indicatorsNode);
+    // wwTelemetry.args.isGearTouchGround = (_gearIsDown && radarAlt < 5.0f);
+
+    // --- ENGINE & FUEL DATA ---
+    wwTelemetry.args.engine1Rpm = (float?)stateNode["RPM 1"] ?? 0.0f;
+    wwTelemetry.args.engine2Rpm = (float?)stateNode["RPM 2"] ?? 0.0f;
+    wwTelemetry.args.engine1Temp = (float?)stateNode["oil temp 1, C"] ?? 0.0f;
+    wwTelemetry.args.engine2Temp = (float?)stateNode["oil temp 2, C"] ?? 0.0f;
+    wwTelemetry.args.fuelQuantity = (float?)stateNode["Mfuel, kg"] ?? 0.0f;
+
+    // --- FLIGHT PHYSICS ---
+    float mach = (float?)stateNode["M"] ?? 0.0f;
+    wwTelemetry.args.machNumber = mach;
+    wwTelemetry.args.gForce = (float?)stateNode["Ny"] ?? 1.0f;
+    wwTelemetry.args.sideSlip = (float?)stateNode["AoS, deg"] ?? 0.0f;
+    wwTelemetry.args.trueAirSpeed = (float?)stateNode["TAS, km/h"] ?? 0.0f;
+    wwTelemetry.args.angleOfAttack = (float?)stateNode["AoA, deg"] ?? 0.0f;
+    wwTelemetry.args.verticalVelocity = (float?)stateNode["Vy, m/s"] ?? 0.0f;
+    wwTelemetry.args.speedbrakesValue = (float?)stateNode["airbrake, %"] ?? 0.0f;
+    // --- VIBRATION MIXER (RAW) ---
+    float jitter = (float)(rnd.NextDouble() * 2.0 - 1.0);
+    float rpmRatio = (wwTelemetry.args.engine1Rpm / 15000.0f); 
+    float engineVibe = (rpmRatio + ((float?)stateNode["throttle 1, %"] ?? 0.0f / 100.0f)) * jitter;
+    
+    // Add transonic buffet: Shake stick when near Mach 1.0
+    float machBuffet = (mach > 0.95f && mach < 1.05f) ? (jitter * 0.5f) : 0.0f;
+
+    wwTelemetry.args.accelerationX = engineVibe + machBuffet;
+    wwTelemetry.args.accelerationZ = engineVibe + machBuffet;
+    wwTelemetry.args.accelerationY = engineVibe + (wwTelemetry.args.gForce - 1.0f);
+
+    // --- WEAPONS ---
+    float w1 = (float?)indicatorsNode["weapon1"] ?? 0.0f;
+    float w2 = (float?)indicatorsNode["weapon2"] ?? 0.0f;
+    if (w1 > 0 || w2 > 0) {
+        gunShells = (gunShells <= 0) ? 1000 : gunShells - 1;
+        wwTelemetry.args.cannonShellsCount = gunShells;
+        wwTelemetry.args.isFireCannonShells = true;
+    } else { wwTelemetry.args.isFireCannonShells = false; }
+
+    wwAPI.Send(WWAPI.WWMessage.UPDATE, wwTelemetry);
+}
+
+        private float GetSimulatedRadarAlt(JsonNode stateNode, JsonNode indicatorsNode)
         {
-            using var ms = new MemoryStream(bytes);
-            using var reader = new BinaryReader(ms);
-            var type = reader.ReadUInt32();
+            float baroAlt = (float?)stateNode["H, m"] ?? 0.0f;
+            float gearStatus = (float?)indicatorsNode["gears"] ?? 0.0f;
+            float speed = (float?)stateNode["TAS, km/h"] ?? 0.0f;
 
-
-            if (type == (uint)IL2Protocol.MessageType.TELEMETRY)
-            {
-                IL2Protocol.Telemetry telemetry = new IL2Protocol.Telemetry();
-                telemetry = new IL2Protocol.Telemetry
-                {
-                    size = reader.ReadUInt16(),
-                    tick = reader.ReadUInt32(),
-                    numOfIndicators = reader.ReadByte()
-                };
-
-                for (int ix = 0; ix < (int)telemetry.numOfIndicators && reader.BaseStream.Position != reader.BaseStream.Length; ix++)
-                {
-
-                    IL2Protocol.SIndicator ind = new IL2Protocol.SIndicator
-                    {
-                        id = IL2Protocol.IndicatorIDExtensions.ToIndicatorID(reader.ReadUInt16()),
-                        numOfValues = reader.ReadByte()
-                    };
-                    ind.values = new float[ind.numOfValues];
-                    for (int ix2 = 0; ix2 < (int)ind.numOfValues; ix2++)
-                    {
-                        ind.values[ix2] = reader.ReadSingle();
-                    }
-
-                    telemetry.indicators.Add(ind);
-                }
-
-                telemetry.numOfEvents = reader.ReadByte();
-
-                for (int ix = 0; ix < (int)telemetry.numOfEvents && reader.BaseStream.Position != reader.BaseStream.Length; ix++)
-                {
-                    var id = IL2Protocol.EventIDExtensions.ToEventID(reader.ReadUInt16());
-                    var size = reader.ReadByte();
-
-                    switch (id)
-                    {
-                        case IL2Protocol.EventID.SET_FOCUS:
-                            {
-                                var ev = new IL2Protocol.SEventSetFocus
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                try
-                                {
-                                    ev.data = reader.ReadString();
-                                }
-                                catch (Exception)
-                                {
-                                    ev.data = "";
-                                }
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SETUP_ENG:
-                            {
-                                var ev = new IL2Protocol.SEventSetupEngine
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.nIndex = reader.ReadInt16();
-                                ev.data.nID = reader.ReadInt16();
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.fMaxRPM = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SETUP_GUN:
-                            {
-                                var ev = new IL2Protocol.SEventSetupGun
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.nIndex = reader.ReadInt16();
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.fProjectileMass = reader.ReadSingle();
-                                ev.data.fShootVelocity = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SETUP_LGEAR:
-                            {
-                                var ev = new IL2Protocol.SEventSetupLandingGear
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.nIndex = reader.ReadInt16();
-                                ev.data.nID = reader.ReadInt16();
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.DROP_BOMB:
-                            {
-                                var ev = new IL2Protocol.SEventDropBomb
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.fMass = reader.ReadSingle();
-                                ev.data.uFlags = reader.ReadUInt16();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.ROCKET_LAUNCH:
-                            {
-                                var ev = new IL2Protocol.SEventRocketLaunch
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.fMass = reader.ReadSingle();
-                                ev.data.uFlags = reader.ReadUInt16();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.HIT:
-                            {
-                                var ev = new IL2Protocol.SEventHit
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.afHitF[0] = reader.ReadSingle();
-                                ev.data.afHitF[1] = reader.ReadSingle();
-                                ev.data.afHitF[2] = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.DAMAGE:
-                            {
-                                var ev = new IL2Protocol.SEventDamage
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.afHitF[0] = reader.ReadSingle();
-                                ev.data.afHitF[1] = reader.ReadSingle();
-                                ev.data.afHitF[2] = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.EXPLOSION:
-                            {
-                                var ev = new IL2Protocol.SEventExplosion
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.afPos[0] = reader.ReadSingle();
-                                ev.data.afPos[1] = reader.ReadSingle();
-                                ev.data.afPos[2] = reader.ReadSingle();
-                                ev.data.fExpRad = reader.ReadSingle();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.GUN_FIRE:
-                            {
-                                var ev = new IL2Protocol.SEventGunFire
-                                {
-                                    id = id,
-                                    size = size,
-                                    data = reader.ReadByte()
-                                };
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SRV_ADDR:
-                            {
-                                var ev = new IL2Protocol.SEventServerAddress
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                var strLength = reader.ReadByte();
-                                var str = reader.ReadBytes((int)strLength);
-                                ev.data = Encoding.ASCII.GetString(str);
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SRV_TITLE:
-                            {
-                                var ev = new IL2Protocol.SEventServerTitle
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data = reader.ReadString();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.SRS_ADDR:
-                            {
-                                var ev = new IL2Protocol.SEventSRSAddress
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data = reader.ReadString();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.CLIENT_DAT:
-                            {
-                                var ev = new IL2Protocol.SEventClientData
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.nClientID = reader.ReadInt32();
-                                ev.data.nServerClientID = reader.ReadInt32();
-                                ev.data.sPlayerName = reader.ReadChars(32);
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        case IL2Protocol.EventID.CTRL_DAT:
-                            {
-                                var ev = new IL2Protocol.SEventControlledData
-                                {
-                                    id = id,
-                                    size = size
-                                };
-                                ev.data.nParentClientID = reader.ReadInt32();
-                                ev.data.nCoalitionID = reader.ReadInt16();
-                                telemetry.events.Add(ev);
-                                break;
-                            }
-                        default:
-                            break;
-                    }
-                }
-
-
-                //if (debugWindow != null && debugWindow.printText)
-                //{
-                //    debugWindow.AddText(telemetry.ToString());
-                //}
-
-                if (telemetry.size == 12 && wwAPI.wwInit)
-                {
-                    debugWindow?.AddText("Empty telemetry, stop WW API");
-                    if (!wwAPI.Send(WWAPI.WWMessage.STOP))
-                    {
-                        debugWindow?.AddText("Failed to send stop ww");
-                    }
-                    wwAPI.wwInit = false;
-                    return;
-                }
-
-                var aoa = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.AOA);
-                var eas = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.EAS);
-                var spdBrk = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.AIR_BRAKES);
-                var gearState = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.LGEARS_STATE);
-                var gearPress = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.LGEARS_PRESS);
-                var accl = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.ACCELERATION);
-
-                var shake = telemetry.indicators.Find(x => x.id == IL2Protocol.IndicatorID.COCKPIT_SHAKE);
-
-                var gunFire = telemetry.events.Find(x => x.id == IL2Protocol.EventID.GUN_FIRE);
-                var bombDrop = telemetry.events.Find(x => x.id == IL2Protocol.EventID.DROP_BOMB);
-                var rocketLaunch = telemetry.events.Find(x => x.id == IL2Protocol.EventID.ROCKET_LAUNCH);
-                var hit = telemetry.events.Find(x => x.id == IL2Protocol.EventID.HIT);
-                
-                WWAPI.WWTelemetryMsg wwTelemetry = new WWAPI.WWTelemetryMsg();
-
-                wwTelemetry.args.angleOfAttack = aoa != null ? aoa.values[0] * (180.0F / float.Pi) : wwTelemetry.args.angleOfAttack;
-
-                // Calculate the rate of change of AoA in degrees per second. We're reading the value every 25ms.
-                float deltaAoA = Math.Abs(wwTelemetry.args.angleOfAttack - lastAoA) / 0.025F;
-                lastAoA = wwTelemetry.args.angleOfAttack;
-                wwTelemetry.args.rateOfAngleOfAttack = deltaAoA;
-
-
-                wwTelemetry.args.trueAirSpeed = eas != null ? eas.values[0] : wwTelemetry.args.trueAirSpeed;
-                wwTelemetry.args.gearValue = gearState != null ? gearState.values[0] : wwTelemetry.args.gearValue;
-                wwTelemetry.args.isGearDown = gearState != null ? gearState.values[0] == 1.0F : wwTelemetry.args.isGearDown;
-                wwTelemetry.args.isGearTouchGround = gearPress != null ? gearPress.values[0] > 0.0F : wwTelemetry.args.isGearTouchGround;
-                if (gunFire != null)
-                {
-                    gunShells -= 1;
-                    if (gunShells < 0)
-                    {
-                        gunShells = 1000;
-                    }
-                    wwTelemetry.args.cannonShellsCount = gunShells;
-                    wwTelemetry.args.isFireCannonShells = true;
-                }
-                else
-                {
-                    wwTelemetry.args.isFireCannonShells = false;
-                }
-                if (bombDrop != null || rocketLaunch != null || hit != null)
-                {
-                    gunShells -= 1;
-                    if (gunShells < 0)
-                    {
-                        gunShells = 1000;
-                    }
-                    wwTelemetry.args.cannonShellsCount = gunShells;
-                }
-                wwTelemetry.args.speedbrakesValue = spdBrk != null ? spdBrk.values[0] : wwTelemetry.args.speedbrakesValue;
-
-                // Increase speed brakes with cockpit shake (freq * amplitude)
-                wwTelemetry.args.speedbrakesValue += shake != null ? shake.values[0] * shake.values[1] : 0.0F;
-
-                wwTelemetry.args.verticalVelocity = accl != null ? accl.values[2] : wwTelemetry.args.verticalVelocity;
-                wwTelemetry.args.accelerationX = accl != null ? accl.values[0] : wwTelemetry.args.accelerationX;
-                wwTelemetry.args.accelerationY = accl != null ? accl.values[1] : wwTelemetry.args.accelerationY;
-                wwTelemetry.args.accelerationZ = accl != null ? accl.values[2] : wwTelemetry.args.accelerationZ;
-                if (!wwAPI.Send(WWAPI.WWMessage.UPDATE, wwTelemetry))
-                {
-                    debugWindow?.AddText("Failed to send WW telemetry");
-                }
-                else if (debugWindow != null && debugWindow.printText)
-                {
-                    debugWindow.AddText("TO WW: " + JsonSerializer.Serialize(wwTelemetry));
-                }
+            if (gearStatus > 0.4f && speed < 50.0f && !_calibrated) {
+                _fieldElevation = baroAlt;
+                _calibrated = true; 
             }
-            else if (type == (uint)IL2Protocol.MessageType.MOTION_ID)
-            {
-                motion.tick = reader.ReadUInt32();
-                motion.yaw = reader.ReadSingle();
-                motion.pitch = reader.ReadSingle();
-                motion.roll = reader.ReadSingle();
-                motion.spin[0] = reader.ReadSingle();
-                motion.spin[1] = reader.ReadSingle();
-                motion.spin[2] = reader.ReadSingle();
-                motion.acc[0] = reader.ReadSingle();
-                motion.acc[1] = reader.ReadSingle();
-                motion.acc[2] = reader.ReadSingle();
-
-                if (debugWindow != null && debugWindow.printText)
-                {
-                    debugWindow.AddText(JsonSerializer.Serialize(motion));
-                }
-            }
+            return Math.Max(0, baroAlt - _fieldElevation);
         }
 
         private void Exit(object? sender, EventArgs e)
